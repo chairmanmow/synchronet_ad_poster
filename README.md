@@ -1,76 +1,143 @@
 # Ad Poster (ANSI/TXT ad uploader)
 
-Interactive Synchronet xtrn for previewing ANSI/TXT ads and posting them into one or more message bases.
+`ad_poster.js` can run in two modes:
+
+- **Interactive UI mode** (online user session / door)
+- **CLI batch mode** (non-interactive / cron)
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `ad_poster.js` | The interactive JavaScript door (invoked via `?jsexec`). |
-| `adposter.ini` | Sysop configuration (paths, defaults, message-area mappings). |
-| `README.md` | This document. |
+| `ad_poster.js` | UI + CLI posting script |
+| `adposter.ini` | Primary config file |
+| `ad_poster.ini` | Alternate config filename (fallback) |
+| `README.md` | This document |
 
-> **Note**: The script looks specifically for `adposter.ini` (no underscore). Keep both file name and location as shown above.
+INI lookup order:
+
+1. `--ini /path/to/file.ini` (if provided)
+2. `adposter.ini` in script directory
+3. `ad_poster.ini` in script directory
 
 ## Installation
 
-1. **Copy the directory**  
-   Place the entire `xtrn/ad_poster/` folder under your Synchronet installation, e.g. `/sbbs/xtrn/ad_poster/`.
+1. Copy folder to `/sbbs/xtrn/ad_poster/`.
+2. Configure SCFG door entry if using interactive mode:
 
-2. **Create (or reuse) an ads directory**  
-   Store your ANSI/TXT ad files somewhere accessible to the BBS (for example `/sbbs/text/bbs_ads`). The `ads_dir` setting in the INI points here.
+```
+Command Line: ?jsexec xtrn/ad_poster/ad_poster.js
+Startup Dir : ../xtrn/ad_poster
+Execution   : Native
+```
 
-3. **Configure SCFG**  
-   ```
-   SCFG -> External Programs -> Online Programs (Doors) -> Add
-      Name/Prompt : Ad Poster (or similar)
-      Internal ID : AD_POSTER
-      Command Line: ?jsexec xtrn/ad_poster/ad_poster.js
-      Startup Dir : ../xtrn/ad_poster
-      Execution   : Native
-      Multi-user  : Yes
-   ```
-   Adjust the relative paths if your Synchronet root differs. The program does not require drop files.
+3. Update `adposter.ini`.
 
-4. **Review `adposter.ini`**  
-   This file lives beside the script (`/sbbs/xtrn/ad_poster/adposter.ini`). Three sections matter:
+## INI format
 
-   ```ini
-   [paths]
-   ads_dir = /sbbs/text/bbs_ads        ; Folder of ANSI/TXT ads. Use absolute paths.
+```ini
+[paths]
+ads_dir = /sbbs/text/bbs_ads
 
-   [defaults]
-   to = All                           ; Default "To" field.
-   from = HM Derdoc                   ; Default "From" (often your sysop name).
-   subject = Advertisement            ; Default subject line.
-   fixed = yes                        ; yes/no: mark MSG_FIXED_FORMAT.
+[defaults]
+to = All
+from = HM Derdoc
+subject = Advertisement
+fixed = yes
+category = bbs_ad
 
-   [locations]
-   local   = LOCAL_ADS                ; menu key → Synchronet sub internal code
-   dovenet = DOVE-ADS
-   fsxnet  = FSX_ADS
-   ```
+[locations]
+local   = LOCAL_ADS
+dovenet = DOVE-ADS
+fsxnet  = FSX_ADS
 
-   - **`ads_dir`** can be any absolute path. Use a directory that only contains ANSI/TXT ads, or the picker will display every file it finds.
-   - **`defaults`** are optional. Leave fields blank to prompt the user each session.
-   - **`locations`** maps menu labels to Synchronet sub-board *internal* codes (exactly as defined in SCFG ➝ Message Areas). Add as many entries as you need; the first entry becomes the default selection when the door opens.
+[overrides]
+future_beach.ans = Futureland Beach Party
 
-5. **Permissions/ACLs**  
-   Ensure the `ads_dir` contents are readable by the Synchronet account and that the target message bases allow posts from the intended users.
+[categories]
+future_beach.ans = bbs_ad
+network_spot.ans = networks_ads
 
-## Usage
+[ad:future_beach.ans]
+subject = Futureland Beach Party
+category = bbs_ad
+```
 
-1. Launch the door from your BBS (or via `?jsexec xtrn/ad_poster/ad_poster.js` at the server console).
-2. Choose a posting location (`[locations]` entries appear as menu options).
-3. Pick an ad file from `ads_dir`. The picker filters for `.ans`, `.txt`, `.asc`, and `.msg` (other files are listed but may not render nicely).
-4. Preview the file if desired (the door strips SAUCE blocks automatically before posting).
-5. Edit To/From/Subject or toggle “fixed format” (preserves ANSI spacing and colors).
-6. Post. The script writes the message via `MsgBase.save_msg()` and reports success/failure on screen.
+### Category behavior
 
-## Tips
+- Default category for random posting comes from `[defaults] category`.
+- If omitted, it defaults to `bbs_ad`.
+- Per-file category can be set in `[categories]` or `[ad:<filename>]`.
 
-- Keep ad filenames short and descriptive—the picker shows only basenames.
-- To add networked subs (e.g., fsxNet, DOVE-Net), copy their exact internal codes from SCFG; mismatches will be rejected before posting.
-- Multiple sysops can share the same `adposter.ini`. If you want per-node defaults, duplicate the directory and update SCFG to point at alternate INIs.
+### Per-file subject behavior
 
-Enjoy curating ads!
+- Per-file subject can be set in `[overrides]`, `[subjects]`, `[topics]`, `[topic_overrides]`, or `[ad:<filename>] subject`.
+
+## CLI batch mode
+
+Run with:
+
+```bash
+jsexec ../xtrn/ad_poster/ad_poster.js [options]
+```
+
+If run with **no args** in non-interactive mode, it will:
+
+- iterate all `[locations]`
+- choose a random ad for each message base
+- filter by default category (`bbs_ad` unless overridden)
+
+### Common options
+
+- `--mode random|explicit`
+- `--file FILE`
+- `--location key[,key...]`
+- `--sub CODE[,CODE...]`
+- `--category NAME`
+- `--same-ad` (use one random file for all target subs)
+- `--subject TEXT`
+- `--file-topic FILE=TEXT` (repeatable)
+- `--to NAME`, `--from NAME`, `--fixed yes|no`
+- `--dry-run`
+
+### Examples
+
+Generic cron-style run (random `bbs_ad` per configured sub):
+
+```bash
+jsexec ../xtrn/ad_poster/ad_poster.js
+```
+
+Random only from `networks_ads` to selected locations:
+
+```bash
+jsexec ../xtrn/ad_poster/ad_poster.js --mode random --category networks_ads --location dovenet,fsxnet
+```
+
+Explicit file to explicit subs:
+
+```bash
+jsexec ../xtrn/ad_poster/ad_poster.js --mode explicit --file future_beach.ans --sub DOVE-ADS,FSX_ADS
+```
+
+CLI per-file topic override (takes precedence over INI):
+
+```bash
+jsexec ../xtrn/ad_poster/ad_poster.js --mode explicit --file future_beach.ans --subject "Global Subject" --file-topic future_beach.ans="Beach Blast"
+```
+
+## Subject precedence
+
+For each post, subject is resolved in this order:
+
+1. `--file-topic FILE=TEXT` (CLI per-file)
+2. `--subject TEXT` (CLI global)
+3. INI per-file override
+4. `[defaults] subject`
+5. fallback: `Advertisement: <filename>`
+
+## Mode selection rules
+
+- If running with args: uses CLI mode.
+- If no args and no online user session: uses CLI mode.
+- If no args and an online user session exists: uses interactive UI mode.
