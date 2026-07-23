@@ -9,9 +9,17 @@
 // Load Synchronet defs.
 load("sbbsdefs.js");
 
-var VERSION = "1.2.0";
+var VERSION = "1.3.0";
 var P_SAVEATR = 0x80;
 var ESC = "\x1b";
+
+// Message readers run at 80 columns. A row that fills column 80 makes the
+// terminal auto-wrap, and the CRLF that follows then costs a second line, so
+// the art comes out double-spaced and sheared. Stay one column clear.
+var MAX_POST_WIDTH = 79;
+
+// Canvas width assumed for art that carries no SAUCE record.
+var DEFAULT_RENDER_WIDTH = 80;
 
 // --- Polyfills -------------------------------------------------------------
 if (!String.prototype.repeat) {
@@ -375,12 +383,10 @@ function menuSelect(title, items, pageSize) {
 }
 
 // --- ANSI/text body handling ----------------------------------------------
-function previewFile(path) {
+// Raw view: the file exactly as it sits on disk. Art stored without row
+// terminators shears here, which is expected -- it is not what gets posted.
+function previewFileRaw(path) {
     console.clear();
-    hr();
-    center("Preview: " + basename(path));
-    hr();
-
     var ok = console.printfile(path, P_SAVEATR);
     if (!ok) {
         println("");
@@ -392,86 +398,283 @@ function previewFile(path) {
     console.getkey();
 }
 
-function stripSauceData(text) {
-    if (!text || text.length < 128) return text;
+// Posted view: byte-for-byte what save_msg() will store.
+function previewFileAsPosted(path, opts) {
+    console.clear();
+
+    var ad;
+    try {
+        ad = readAdBody(path, opts);
+    } catch (e) {
+        println("Failed to render: " + e);
+        console.getkey();
+        return;
+    }
+
+    console.print(ad.body);
+    println("");
+    println(describeBodyReport(ad.report));
+    if (ad.report.overWide) {
+        println("WARNING: " + ad.report.overWide + " row(s) exceed " + ad.report.limit +
+            " columns and will wrap in the reader.");
+    }
+    println("Press any key to return...");
+    console.getkey();
+}
+
+function previewFile(path, opts) {
+    console.clear();
+    hr();
+    center("Preview: " + basename(path));
+    hr();
+    println("");
+    println("P) As posted to the message base (recommended)");
+    println("R) Raw file, as stored on disk");
+    println("Q) Back");
+    console.print("> ");
+
+    var k = console.getkey(K_UPPER);
+    println("");
+
+    if (k === "P" || k === "\r" || k === "\n") previewFileAsPosted(path, opts);
+    else if (k === "R") previewFileRaw(path);
+}
+
+// SAUCE is a 128-byte trailer, optionally preceded by a COMNT block. For
+// character art (DataType 1) TInfo1 holds the canvas width the artist drew at,
+// which is the only reliable way to re-wrap art saved without row terminators.
+function parseSauce(text) {
+    var out = { body: text, width: 0, rows: 0 };
+    if (!text || text.length < 128) return out;
 
     var tailLen = Math.min(512, text.length);
-    var tail = text.slice(-tailLen);
-    var marker = tail.lastIndexOf("SAUCE00");
-    if (marker === -1) return text;
+    var marker = text.slice(-tailLen).lastIndexOf("SAUCE00");
+    if (marker === -1) return out;
 
-    var sauceStart = text.length - tailLen + marker;
-    if (text.length - sauceStart < 128) return text;
+    var start = text.length - tailLen + marker;
+    if (text.length - start < 128) return out;
 
-    var cutIdx = sauceStart;
-    var commentCount = text.charCodeAt(sauceStart + 104);
+    var dataType = text.charCodeAt(start + 94);
+    var fileType = text.charCodeAt(start + 95);
+    if (dataType === 1 && (fileType === 0 || fileType === 1)) {  // ASCII or ANSi
+        out.width = text.charCodeAt(start + 96) | (text.charCodeAt(start + 97) << 8);
+        out.rows = text.charCodeAt(start + 98) | (text.charCodeAt(start + 99) << 8);
+    }
+
+    var cutIdx = start;
+    var commentCount = text.charCodeAt(start + 104);
     if (!isNaN(commentCount) && commentCount > 0) {
-        var commentBytes = 5 + (commentCount * 64);
-        var commentStart = cutIdx - commentBytes;
+        var commentStart = cutIdx - (5 + (commentCount * 64));
         if (commentStart >= 0 && text.substr(commentStart, 5) === "COMNT") {
             cutIdx = commentStart;
         }
     }
-
     if (cutIdx > 0 && text.charCodeAt(cutIdx - 1) === 0x1A) cutIdx--;
-    return text.substring(0, cutIdx);
+
+    out.body = text.substring(0, cutIdx);
+    return out;
 }
 
-function wrapAt80Columns(text) {
-    if (!text) return text;
+// Returns the whole escape sequence beginning at index i.
+function matchEscapeSeq(text, i) {
+    if (text.charAt(i) !== ESC) return "";
+    if (text.charAt(i + 1) !== "[") {
+        return (i + 1 < text.length) ? text.substr(i, 2) : ESC;
+    }
 
-    var lines = text.split(/\r\n|\r|\n/);
-    var wrapped = [];
+    for (var j = i + 2; j < text.length; j++) {
+        var c = text.charCodeAt(j);
+        if (c >= 0x40 && c <= 0x7E) return text.substring(i, j + 1);  // final byte
+    }
 
-    for (var i = 0; i < lines.length; i++) {
-        var line = lines[i];
-        if (!line || line.length <= 80) {
-            wrapped.push(line);
+    return text.substring(i);  // unterminated
+}
+
+// Track background only: a trailing space is art if it is painted, blank if not.
+function applySgrBackground(seq, bg) {
+    var params = seq.substring(2, seq.length - 1).split(";");
+    for (var i = 0; i < params.length; i++) {
+        var n = parseInt(params[i], 10);
+        if (isNaN(n)) n = 0;
+        if (n === 0) bg = 0;
+        else if (n >= 40 && n <= 47) bg = n - 40;
+        else if (n >= 100 && n <= 107) bg = n - 100;
+        else if (n === 49) bg = 0;
+    }
+    return bg;
+}
+
+// Replay the art through a minimal terminal to recover its row grid. Much art
+// is stored with no row terminators at all, relying on the terminal to wrap at
+// the canvas width, so counting columns is the only way to find the rows.
+function renderAnsiRows(text, width, report) {
+    var rows = [];
+    var row = [];          // tokens: ["sgr", seq] | ["chr", char, bg]
+    var col = 0;
+    var bg = 0;
+    var pendingWrap = false;
+    var i = 0;
+
+    function endRow() {
+        rows.push(row);
+        row = [];
+        col = 0;
+        pendingWrap = false;
+    }
+
+    function putChar(ch) {
+        if (pendingWrap) endRow();
+        row.push(["chr", ch, bg]);
+        col++;
+        // Deferred wrap, as a real terminal does it: the cursor sits on the last
+        // column until something else is printed, so an explicit CRLF right
+        // after a full row costs no extra line.
+        if (col >= width) pendingWrap = true;
+    }
+
+    while (i < text.length) {
+        var code = text.charCodeAt(i);
+        var ch = text.charAt(i);
+
+        if (code === 0x1A) break;               // DOS EOF marker
+
+        // Art editors emit NUL as a blank cell, and it is by far the most common
+        // byte in a typical .ans. It cannot go into a message body (NUL
+        // terminates the text), and neither can Ctrl-A (Synchronet reads it as
+        // an attribute code and eats the byte after it). Substitute a blank so
+        // the cell -- and therefore every column to its right -- survives.
+        if (code === 0x00 || code === 0x01) {
+            putChar(" ");
+            i++;
             continue;
         }
 
-        var col = 0;
-        var current = "";
-        var j = 0;
+        if (ch === ESC) {
+            var seq = matchEscapeSeq(text, i);
+            var fin = seq.charAt(seq.length - 1);
+            i += seq.length;
 
-        while (j < line.length) {
-            if (line[j] === ESC && j + 1 < line.length && line[j + 1] === "[") {
-                var seqEnd = j + 2;
-                while (seqEnd < line.length && !/[A-Za-z]/.test(line[seqEnd])) seqEnd++;
-                if (seqEnd < line.length) seqEnd++;
-
-                current += line.substring(j, seqEnd);
-                j = seqEnd;
-                continue;
+            if (seq.charAt(1) !== "[") {
+                report.dropped++;
+            } else if (fin === "m") {
+                bg = applySgrBackground(seq, bg);
+                row.push(["sgr", seq]);
+            } else if (fin === "C") {
+                // Cursor-forward is just a run of blanks in a hard-wrapped body.
+                var n = parseInt(seq.substring(2, seq.length - 1), 10);
+                if (isNaN(n) || n < 1) n = 1;
+                while (n-- > 0) putChar(" ");
+            } else if (fin === "K" || fin === "s" || fin === "u" || fin === "h" || fin === "l") {
+                // Erase-to-EOL / save / restore / mode: no effect once rows are hard-wrapped.
+            } else {
+                report.dropped++;               // absolute positioning cannot survive re-wrapping
             }
-
-            var ch = line[j];
-            if (ch === "\r" || ch === "\n") {
-                wrapped.push(current);
-                current = "";
-                col = 0;
-                j++;
-                continue;
-            }
-
-            current += ch;
-            col++;
-            j++;
-
-            if (col >= 80) {
-                wrapped.push(current);
-                current = "";
-                col = 0;
-            }
+            continue;
         }
 
-        if (current) wrapped.push(current);
+        if (code === 0x0D) {                    // CR, or the CR of a CRLF
+            if (text.charCodeAt(i + 1) === 0x0A) i++;
+            endRow();
+            i++;
+            continue;
+        }
+        if (code === 0x0A) {
+            endRow();
+            i++;
+            continue;
+        }
+        if (code === 0x09) {                    // tab -> next 8-column stop
+            var stop = 8 - (col % 8);
+            while (stop-- > 0) putChar(" ");
+            i++;
+            continue;
+        }
+        if (code === 0x08) {                    // backspace: unrepresentable
+            report.dropped++;
+            i++;
+            continue;
+        }
+
+        putChar(ch);
+        i++;
     }
 
-    return wrapped.join("\r\n");
+    if (row.length) rows.push(row);
+    return rows;
 }
 
-function readAdBody(filePath) {
+// Drop trailing blanks, but keep painted ones, and keep any colour changes that
+// sat in the trimmed tail so the next row still starts in the right attribute.
+function rowToLine(row) {
+    var end = row.length;
+    while (end > 0) {
+        var t = row[end - 1];
+        if (t[0] === "sgr") { end--; continue; }
+        if (t[1] === " " && t[2] === 0) { end--; continue; }
+        break;
+    }
+
+    var text = "";
+    var width = 0;
+    for (var i = 0; i < end; i++) {
+        text += row[i][1];
+        if (row[i][0] === "chr") width++;
+    }
+    for (var j = end; j < row.length; j++) {
+        if (row[j][0] === "sgr") text += row[j][1];
+    }
+
+    return { text: text, width: width };
+}
+
+function buildAdBody(raw, opts) {
+    opts = opts || {};
+
+    var sauce = parseSauce(raw);
+    var report = {
+        dropped: 0,      // escape sequences that cannot survive re-wrapping
+        rows: 0,
+        maxWidth: 0,
+        overWide: 0,
+        sauceWidth: sauce.width
+    };
+
+    var renderWidth = parseInt(opts.renderWidth, 10);
+    if (isNaN(renderWidth) || renderWidth < 8) renderWidth = sauce.width || DEFAULT_RENDER_WIDTH;
+    report.renderWidth = renderWidth;
+
+    var maxWidth = parseInt(opts.maxWidth, 10);
+    if (isNaN(maxWidth) || maxWidth < 8) maxWidth = MAX_POST_WIDTH;
+    report.limit = maxWidth;
+
+    var rows = renderAnsiRows(sauce.body, renderWidth, report);
+
+    var lines = [];
+    for (var i = 0; i < rows.length; i++) {
+        var line = rowToLine(rows[i]);
+        if (line.width > report.maxWidth) report.maxWidth = line.width;
+        if (line.width > maxWidth) report.overWide++;
+        lines.push(line.text);
+    }
+
+    while (lines.length && !lines[lines.length - 1].length) lines.pop();
+    report.rows = lines.length;
+
+    // Reset first so the ad does not inherit the reader's colours, and last so
+    // it does not leak its own into whatever the reader prints next.
+    var body = lines.length ? (ESC + "[0m" + lines.join("\r\n") + ESC + "[0m\r\n") : "";
+    return { body: body, report: report };
+}
+
+function describeBodyReport(report) {
+    var s = "rows=" + report.rows + " width=" + report.maxWidth + "/" + report.limit +
+        " canvas=" + report.renderWidth + (report.sauceWidth ? " (SAUCE)" : " (assumed)");
+    if (report.overWide) s += " OVER-WIDE-ROWS=" + report.overWide;
+    if (report.dropped) s += " dropped-seqs=" + report.dropped;
+    return s;
+}
+
+function readAdBody(filePath, opts) {
     var f = new File(filePath);
     if (!f.open("rb")) {
         throw new Error("Error " + f.error + " opening file: " + filePath);
@@ -480,8 +683,7 @@ function readAdBody(filePath) {
     var raw = f.read(f.length) || "";
     f.close();
 
-    var stripped = stripSauceData(raw).replace(/\r?\n/g, "\r\n");
-    return wrapAt80Columns(stripped);
+    return buildAdBody(raw, opts);
 }
 
 // --- Posting ---------------------------------------------------------------
@@ -604,6 +806,9 @@ function parseCliArgs(rawArgs) {
         dateStr: "",
         sameAd: false,
         dryRun: false,
+        preview: false,
+        maxWidth: "",        // hard-wrap limit for the posted body
+        renderWidth: "",     // canvas width override (else SAUCE, else 80)
         quiet: false
     };
 
@@ -655,6 +860,12 @@ function parseCliArgs(rawArgs) {
             opts.sameAd = true;
         } else if (a === "--dry-run") {
             opts.dryRun = true;
+        } else if (a === "--preview") {
+            opts.preview = true;
+        } else if (a === "--width") {
+            opts.maxWidth = needValue(i, a); i++;
+        } else if (a === "--render-width" || a === "--canvas-width") {
+            opts.renderWidth = needValue(i, a); i++;
         } else if (a === "--quiet") {
             opts.quiet = true;
         } else if (a.charAt(0) === "-") {
@@ -699,12 +910,69 @@ function printUsage() {
     println("  --date-num VALUE          numeric date override (-D style)");
     println("  --date-str VALUE          date/time string override (-T style)");
     println("");
+    println("Layout:");
+    println("  --width N                 hard-wrap limit for the body (default " + MAX_POST_WIDTH + ")");
+    println("  --render-width N          canvas width of the art (default: SAUCE, else " + DEFAULT_RENDER_WIDTH + ")");
+    println("");
     println("Misc:");
     println("  --ini PATH                INI path (default: adposter.ini / ad_poster.ini)");
     println("  --ads-dir PATH            override ads_dir from INI");
     println("  --dry-run                 show what would be posted, do not post");
+    println("  --preview                 render the ad to stdout, do not post");
     println("  --quiet                   quieter logging");
     println("  --help                    this help");
+    println("");
+    println("Preview an ad exactly as it will appear in the message base:");
+    println("  jsexec ../xtrn/ad_poster/ad_poster.js --preview -f future_beach.ans");
+}
+
+function emitRaw(s) {
+    if (hasConsoleOutput()) console.print(s);
+    else if (typeof write === "function") write(s);
+    else if (typeof print === "function") print(s);
+}
+
+// Render ads to stdout instead of posting, so layout can be checked before it
+// lands in a message base (and, for netmail, in front of other people's users).
+function runPreview(opts) {
+    var runtimeCfg = loadRuntimeConfig(opts.iniPath);
+    var cfg = runtimeCfg.cfg;
+    if (opts.adsDir) cfg.adsDir = ensureTrailingSlash(opts.adsDir);
+
+    var adFiles = listAdFiles(cfg.adsDir);
+    if (!adFiles.length) throw new Error("No ad files found in " + cfg.adsDir);
+
+    var targets = [];
+    if (opts.fileArg) {
+        var one = resolveExplicitFile(opts.fileArg, cfg.adsDir, adFiles);
+        if (!one) throw new Error("Unable to resolve ad file: " + opts.fileArg);
+        targets.push(one);
+    } else if (opts.category) {
+        targets = adFiles.filter(function (p) {
+            return String(getFileCategory(p, cfg)).toLowerCase() === String(opts.category).toLowerCase();
+        });
+        if (!targets.length) throw new Error("No ads in category '" + opts.category + "'");
+    } else {
+        targets = adFiles;
+    }
+
+    var worst = 0;
+    targets.forEach(function (adPath) {
+        var ad = readAdBody(adPath, opts);
+        worst += ad.report.overWide;
+
+        println("");
+        println("=== " + basename(adPath) + " [" + describeBodyReport(ad.report) + "] ===");
+        emitRaw(ad.body);
+        if (ad.report.overWide) {
+            println("WARNING: " + ad.report.overWide + " row(s) exceed " + ad.report.limit +
+                " columns and will wrap in an 80-column reader.");
+        }
+    });
+
+    println("");
+    println("Previewed " + targets.length + " ad(s); over-wide rows: " + worst);
+    return { attempted: targets.length, posted: targets.length, failed: 0 };
 }
 
 function runBatch(opts) {
@@ -782,19 +1050,21 @@ function runBatch(opts) {
             if (!opts.quiet) {
                 println("DRY-RUN: " + subCode + " <= " + basename(adPath) +
                     " [category=" + getFileCategory(adPath, cfg) +
-                    ", subject=\"" + hdrs.subject + "\"]");
+                    ", subject=\"" + hdrs.subject + "\"] " +
+                    describeBodyReport(readAdBody(adPath, opts).report));
             }
             stats.posted++;
             return;
         }
 
         try {
-            var body = readAdBody(adPath);
-            postToMsgBase(subCode, body, hdrs);
+            var ad = readAdBody(adPath, opts);
+            postToMsgBase(subCode, ad.body, hdrs);
             stats.posted++;
             if (!opts.quiet) {
                 println("Posted: " + subCode + " <= " + basename(adPath) +
-                    " [category=" + getFileCategory(adPath, cfg) + "]");
+                    " [category=" + getFileCategory(adPath, cfg) + "] " +
+                    describeBodyReport(ad.report));
             }
         } catch (e) {
             stats.failed++;
@@ -902,7 +1172,7 @@ function runUI(cliIniPath) {
                 console.getkey();
                 continue;
             }
-            previewFile(state.filePath);
+            previewFile(state.filePath, state);
         }
         else if (c === "4") {
             state.toName = promptStr("To", state.toName, 64);
@@ -936,7 +1206,7 @@ function runUI(cliIniPath) {
             }
 
             try {
-                var body = readAdBody(state.filePath);
+                var ad = readAdBody(state.filePath, state);
                 var hdrs = buildHeaders(state.filePath, cfg, {
                     to: state.toName,
                     from: state.fromName,
@@ -947,9 +1217,10 @@ function runUI(cliIniPath) {
                     fileSubjects: {}
                 });
 
-                postToMsgBase(state.subCode, body, hdrs);
+                postToMsgBase(state.subCode, ad.body, hdrs);
                 println("");
                 println("Posted successfully to: " + state.subCode);
+                println(describeBodyReport(ad.report));
             } catch (e) {
                 println("");
                 println("ERROR posting: " + e);
@@ -971,6 +1242,11 @@ function runMain() {
 
     if (opts.help) {
         printUsage();
+        return;
+    }
+
+    if (opts.preview) {
+        runPreview(opts);
         return;
     }
 
