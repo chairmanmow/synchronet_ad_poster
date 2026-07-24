@@ -9,7 +9,7 @@
 // Load Synchronet defs.
 load("sbbsdefs.js");
 
-var VERSION = "1.3.0";
+var VERSION = "1.4.0";
 var P_SAVEATR = 0x80;
 var ESC = "\x1b";
 
@@ -234,6 +234,7 @@ function loadConfigFromIniObject(ini) {
             from: defaultsRaw.from || (system ? system.operator : "Sysop"),
             subject: defaultsRaw.subject || "Advertisement",
             fixed: parseBool(defaultsRaw.fixed, true),
+            strict: parseBool(defaultsRaw.strict, true),
             category: (defaultsRaw.category || defaultsRaw.ad_category || defaultsRaw.default_category || "bbs_ad")
         },
         locations: locations,
@@ -414,9 +415,9 @@ function previewFileAsPosted(path, opts) {
     console.print(ad.body);
     println("");
     println(describeBodyReport(ad.report));
-    if (ad.report.overWide) {
-        println("WARNING: " + ad.report.overWide + " row(s) exceed " + ad.report.limit +
-            " columns and will wrap in the reader.");
+    if (ad.report.clamped) {
+        println("NOTE: " + ad.report.clamped + " row(s) were trimmed to " + ad.report.limit +
+            " columns (art was drawn wider than " + ad.report.limit + ").");
     }
     println("Press any key to return...");
     console.getkey();
@@ -566,8 +567,16 @@ function renderAnsiRows(text, width, report) {
                 while (n-- > 0) putChar(" ");
             } else if (fin === "K" || fin === "s" || fin === "u" || fin === "h" || fin === "l") {
                 // Erase-to-EOL / save / restore / mode: no effect once rows are hard-wrapped.
+            } else if (fin === "A" || fin === "B" || fin === "D" || fin === "E" ||
+                       fin === "F" || fin === "G" || fin === "H" || fin === "f" || fin === "d") {
+                // Cursor movement (up/down/back/next/prev/column/position). The art
+                // draws non-linearly -- it paints cells out of top-to-bottom order --
+                // so a hard-wrapped linear body cannot reproduce it. Count it apart
+                // from benign drops: this is a hard reason to reject the ad.
+                report.positioning++;
+                report.dropped++;
             } else {
-                report.dropped++;               // absolute positioning cannot survive re-wrapping
+                report.dropped++;               // other sequences that cannot survive re-wrapping
             }
             continue;
         }
@@ -603,9 +612,19 @@ function renderAnsiRows(text, width, report) {
     return rows;
 }
 
-// Drop trailing blanks, but keep painted ones, and keep any colour changes that
-// sat in the trimmed tail so the next row still starts in the right attribute.
-function rowToLine(row) {
+// Turn a recovered row into a postable line:
+//  - Hard-cap the printable columns at maxWidth (79). A row that fills column 80
+//    wraps and double-spaces in an 80-column reader, so drop any column past the
+//    limit -- for canvas art that surplus is the 80th edge column.
+//  - Drop trailing blanks, but keep painted ones.
+//  - Keep colour changes that sat in the trimmed/dropped tail so the next row
+//    still starts in the right attribute.
+function rowToLine(row, maxWidth) {
+    var fullWidth = 0;
+    for (var i = 0; i < row.length; i++) if (row[i][0] === "chr") fullWidth++;
+
+    var limit = (maxWidth && maxWidth > 0) ? maxWidth : fullWidth;
+
     var end = row.length;
     while (end > 0) {
         var t = row[end - 1];
@@ -616,15 +635,16 @@ function rowToLine(row) {
 
     var text = "";
     var width = 0;
-    for (var i = 0; i < end; i++) {
-        text += row[i][1];
-        if (row[i][0] === "chr") width++;
+    for (var j = 0; j < end; j++) {
+        if (row[j][0] === "sgr") { text += row[j][1]; continue; }
+        if (width < limit) { text += row[j][1]; width++; }
+        // else: printable cell past the width limit -- dropped
     }
-    for (var j = end; j < row.length; j++) {
-        if (row[j][0] === "sgr") text += row[j][1];
+    for (var k = end; k < row.length; k++) {
+        if (row[k][0] === "sgr") text += row[k][1];
     }
 
-    return { text: text, width: width };
+    return { text: text, width: width, fullWidth: fullWidth };
 }
 
 function buildAdBody(raw, opts) {
@@ -633,9 +653,10 @@ function buildAdBody(raw, opts) {
     var sauce = parseSauce(raw);
     var report = {
         dropped: 0,      // escape sequences that cannot survive re-wrapping
+        positioning: 0,  // cursor-movement sequences: art is non-linear, reflow corrupts it
         rows: 0,
         maxWidth: 0,
-        overWide: 0,
+        clamped: 0,      // rows trimmed back to the width limit (were 80+ wide)
         sauceWidth: sauce.width
     };
 
@@ -651,9 +672,9 @@ function buildAdBody(raw, opts) {
 
     var lines = [];
     for (var i = 0; i < rows.length; i++) {
-        var line = rowToLine(rows[i]);
+        var line = rowToLine(rows[i], maxWidth);
         if (line.width > report.maxWidth) report.maxWidth = line.width;
-        if (line.width > maxWidth) report.overWide++;
+        if (line.fullWidth > maxWidth) report.clamped++;
         lines.push(line.text);
     }
 
@@ -669,9 +690,37 @@ function buildAdBody(raw, opts) {
 function describeBodyReport(report) {
     var s = "rows=" + report.rows + " width=" + report.maxWidth + "/" + report.limit +
         " canvas=" + report.renderWidth + (report.sauceWidth ? " (SAUCE)" : " (assumed)");
-    if (report.overWide) s += " OVER-WIDE-ROWS=" + report.overWide;
+    if (report.clamped) s += " CLAMPED-ROWS=" + report.clamped;
+    if (report.positioning) s += " CURSOR-POS-SEQS=" + report.positioning;
     if (report.dropped) s += " dropped-seqs=" + report.dropped;
     return s;
+}
+
+// Refuse to post art that will render badly once it reaches a message base --
+// and, over a network, other people's readers. These are the failure modes that
+// make an ad come out sheared or double-spaced no matter how good the source art
+// looked in the editor. Returns a list of human-readable problems (empty = OK).
+function validateAd(report) {
+    var problems = [];
+    if (!report.rows) {
+        problems.push("empty body (no printable rows recovered)");
+    }
+    if (report.positioning) {
+        problems.push(report.positioning + " cursor-positioning sequence(s) -- the art " +
+            "draws non-linearly and cannot survive re-flow into a message body");
+    }
+    return problems;
+}
+
+// A message body carrying any high-bit byte is CP437 character art. Tag it
+// explicitly so SBBSecho emits "CHRS: CP437 2" on FTN export instead of relying
+// on the fallback -- and so a network round-trip cannot mis-sniff it as UTF-8.
+function bodyNeedsCp437(body) {
+    var s = String(body || "");
+    for (var i = 0; i < s.length; i++) {
+        if (s.charCodeAt(i) >= 0x80) return true;
+    }
+    return false;
 }
 
 function readAdBody(filePath, opts) {
@@ -688,6 +737,10 @@ function readAdBody(filePath, opts) {
 
 // --- Posting ---------------------------------------------------------------
 function postToMsgBase(sub_code, body, hdrs) {
+    // Declare CP437 explicitly for character art so the FTN export is not left to
+    // guess the charset (and cannot be re-detected as UTF-8 on a round-trip).
+    if (!hdrs.ftn_charset && bodyNeedsCp437(body)) hdrs.ftn_charset = "CP437 2";
+
     var mb = new MsgBase(sub_code);
     if (!mb.open()) throw new Error("Open msgbase failed (" + sub_code + "): " + mb.last_error);
     try {
@@ -805,6 +858,7 @@ function parseCliArgs(rawArgs) {
         dateNum: "",
         dateStr: "",
         sameAd: false,
+        force: false,        // post even if the ad fails validation
         dryRun: false,
         preview: false,
         maxWidth: "",        // hard-wrap limit for the posted body
@@ -858,6 +912,8 @@ function parseCliArgs(rawArgs) {
             opts.dateStr = needValue(i, a); i++;
         } else if (a === "--same-ad") {
             opts.sameAd = true;
+        } else if (a === "--force" || a === "--allow-misshapen") {
+            opts.force = true;
         } else if (a === "--dry-run") {
             opts.dryRun = true;
         } else if (a === "--preview") {
@@ -919,8 +975,14 @@ function printUsage() {
     println("  --ads-dir PATH            override ads_dir from INI");
     println("  --dry-run                 show what would be posted, do not post");
     println("  --preview                 render the ad to stdout, do not post");
+    println("  --force                   post even if an ad fails validation");
     println("  --quiet                   quieter logging");
     println("  --help                    this help");
+    println("");
+    println("Validation:");
+    println("  Rows wider than " + MAX_POST_WIDTH + " columns are trimmed to fit (art drawn at 80");
+    println("  wraps in an 80-col reader). Ads that cannot be posted cleanly -- cursor");
+    println("  positioning or an empty body -- are refused unless --force / strict=no.");
     println("");
     println("Preview an ad exactly as it will appear in the message base:");
     println("  jsexec ../xtrn/ad_poster/ad_poster.js --preview -f future_beach.ans");
@@ -956,22 +1018,26 @@ function runPreview(opts) {
         targets = adFiles;
     }
 
-    var worst = 0;
+    var rejected = 0;
     targets.forEach(function (adPath) {
         var ad = readAdBody(adPath, opts);
-        worst += ad.report.overWide;
+        var problems = validateAd(ad.report);
 
         println("");
         println("=== " + basename(adPath) + " [" + describeBodyReport(ad.report) + "] ===");
         emitRaw(ad.body);
-        if (ad.report.overWide) {
-            println("WARNING: " + ad.report.overWide + " row(s) exceed " + ad.report.limit +
-                " columns and will wrap in an 80-column reader.");
+        if (problems.length) {
+            rejected++;
+            println("WOULD REFUSE: " + problems.join("; "));
+        } else if (ad.report.clamped) {
+            println("OK to post (" + ad.report.clamped + " row(s) trimmed to " + ad.report.limit + " cols).");
+        } else {
+            println("OK to post.");
         }
     });
 
     println("");
-    println("Previewed " + targets.length + " ad(s); over-wide rows: " + worst);
+    println("Previewed " + targets.length + " ad(s); " + rejected + " would be refused.");
     return { attempted: targets.length, posted: targets.length, failed: 0 };
 }
 
@@ -1018,6 +1084,10 @@ function runBatch(opts) {
         sharedRandom = pickRandom(randomPool);
     }
 
+    // Strict by default: a misshapen ad is refused, not posted. The sysop can
+    // opt out per-run with --force or permanently with [defaults] strict = no.
+    var enforce = !opts.force && cfg.defaults.strict;
+
     var stats = {
         attempted: 0,
         posted: 0,
@@ -1044,6 +1114,31 @@ function runBatch(opts) {
             return;
         }
 
+        var ad;
+        try {
+            ad = readAdBody(adPath, opts);
+        } catch (e) {
+            stats.failed++;
+            if (!opts.quiet) println("ERROR reading " + basename(adPath) + ": " + e);
+            return;
+        }
+
+        // Pre-flight the reflowed body. Refuse anything that would embarrass us
+        // downstream unless the run explicitly forces it.
+        var problems = validateAd(ad.report);
+        if (problems.length && enforce) {
+            stats.failed++;
+            if (!opts.quiet) {
+                println("REFUSED: " + subCode + " <= " + basename(adPath) + " -- " + problems.join("; "));
+                println("         " + describeBodyReport(ad.report));
+                println("         Re-save the art linear top-to-bottom with no cursor positioning, or pass --force.");
+            }
+            return;
+        }
+        if (problems.length && !opts.quiet) {
+            println("WARNING (forced): " + basename(adPath) + " -- " + problems.join("; "));
+        }
+
         var hdrs = buildHeaders(adPath, cfg, opts);
 
         if (opts.dryRun) {
@@ -1051,14 +1146,13 @@ function runBatch(opts) {
                 println("DRY-RUN: " + subCode + " <= " + basename(adPath) +
                     " [category=" + getFileCategory(adPath, cfg) +
                     ", subject=\"" + hdrs.subject + "\"] " +
-                    describeBodyReport(readAdBody(adPath, opts).report));
+                    describeBodyReport(ad.report));
             }
             stats.posted++;
             return;
         }
 
         try {
-            var ad = readAdBody(adPath, opts);
             postToMsgBase(subCode, ad.body, hdrs);
             stats.posted++;
             if (!opts.quiet) {
@@ -1207,6 +1301,22 @@ function runUI(cliIniPath) {
 
             try {
                 var ad = readAdBody(state.filePath, state);
+
+                var problems = validateAd(ad.report);
+                if (problems.length && cfg.defaults.strict) {
+                    println("");
+                    println("REFUSED -- this ad would render badly once posted:");
+                    for (var pi = 0; pi < problems.length; pi++) println("  - " + problems[pi]);
+                    println(describeBodyReport(ad.report));
+                    println("");
+                    if (!yesNo("Post anyway (override)?", false)) {
+                        println("Not posted.");
+                        println("Press any key...");
+                        console.getkey();
+                        continue;
+                    }
+                }
+
                 var hdrs = buildHeaders(state.filePath, cfg, {
                     to: state.toName,
                     from: state.fromName,

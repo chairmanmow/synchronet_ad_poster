@@ -99,6 +99,7 @@ If run with **no args** in non-interactive mode, it will:
 - `--file-topic FILE=TEXT` (repeatable)
 - `--to NAME`, `--from NAME`, `--fixed yes|no`
 - `--width N` / `--render-width N` (see [ANSI layout](#ansi-layout))
+- `--force` (post even if an ad fails validation — see [Validation](#validation))
 - `--dry-run`
 - `--preview`
 
@@ -162,6 +163,50 @@ row grid, then emits hard-wrapped CRLF rows:
 Posts report the resulting geometry, e.g.
 `rows=20 width=79/79 canvas=79 (SAUCE)`. If any row still exceeds the limit the
 report says `OVER-WIDE-ROWS=n` — that ad will wrap in an 80-column reader.
+
+## Validation
+
+Re-flowing recovers the row grid. Two things are then enforced so an ad never
+lands sheared or double-spaced — including on other people's boards over a
+network.
+
+**Rows are hard-capped at 79 columns.** A row that fills column 80 wraps in an
+80-column reader and the ad comes out double-spaced. Any column past the limit
+is trimmed off — for canvas art that surplus is just the 80th edge column. This
+is automatic; art drawn at 80 is posted at 79 and reported as `CLAMPED-ROWS=n`
+so you can see it happened. (Best practice: draw at **≤79** so nothing is
+trimmed. `--width N` changes the limit.)
+
+**Un-postable ads are refused.** Some art cannot be re-flowed into a linear
+message body at all, and those are refused rather than shipped:
+
+- **Cursor positioning** (`CURSOR-POS-SEQS=n`) — the art uses cursor-movement
+  escapes (`ESC[A/B/D/E/F/G/H`, `ESC[…f`, `ESC[…d`), i.e. it paints cells out of
+  top-to-bottom order. A linear message body cannot reproduce that. Re-save the
+  art as linear top-to-bottom output.
+- **Empty body** — nothing printable was recovered.
+
+A refused ad is reported as `REFUSED: … -- <reason>`, is **not** posted, counts
+as a failure, and the batch run exits non-zero so cron notices. Other ads in the
+same run still go out. In the UI, a refused ad prompts before posting.
+
+Override when you really mean it:
+
+- `--force` (alias `--allow-misshapen`) — post a refused ad anyway, with a
+  `WARNING`.
+- `[defaults] strict = no` in the INI — disable the refusal gate entirely
+  (clamping still applies).
+
+Use `--preview` or `--dry-run` first: both show the per-ad verdict
+(`OK to post.` / `WOULD REFUSE: …`) and any clamping without posting.
+
+### Character set
+
+Ads carrying high-bit CP437 bytes are tagged `ftn_charset = "CP437 2"` on save,
+so SBBSecho emits `CHRS: CP437 2` on FTN export instead of relying on the
+fallback — and a network round-trip cannot mis-detect them as UTF-8. Pure-ASCII
+ads are left untagged (SBBSecho tags them `ASCII`). This is automatic; there is
+no flag.
 
 ### Previewing
 
